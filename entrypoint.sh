@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Codex Remote on Railway — container entrypoint
+# Codex Remote on Railway — container entrypoint (FIXED for single volume)
 # ---------------------------------------------------------------------------
+# This version uses symlinks to make /root/.codex and /var/lib/tailscale
+# persistent across redeploys by storing them on the /workspace volume.
+#
+# With a single volume mount at /workspace:
+#   /workspace/.codex-data → symlinked to /root/.codex
+#   /workspace/.tailscale-state → symlinked to /var/lib/tailscale
+#
+# This ensures:
+#   1. Codex session state (resume, fork, archive) survives redeploys
+#   2. Tailscale node identity persists so you don't rejoin the tailnet
+#   3. All state lives on one persistent volume
+#
 # 1. Optionally join a Tailscale tailnet (with Tailscale SSH) — only when
 #    TS_AUTHKEY / TAILSCALE_AUTHKEY is set. Idempotent: persisted state on
 #    the volume keeps the node identity across redeploys, so a subsequent
@@ -17,6 +29,65 @@
 set -euo pipefail
 
 log() { printf '[entrypoint] %s\n' "$*"; }
+
+# --- Persistent storage via symlinks on /workspace -------------------------
+setup_persistent_dirs() {
+  local workspace="${WORKSPACE_DIR:-/workspace}"
+  
+  # Ensure /workspace exists and is writable
+  if [ ! -d "$workspace" ]; then
+    log "ERROR: $workspace does not exist or is not mounted."
+    log "       Verify the volume is mounted at /workspace."
+    exit 1
+  fi
+  
+  # Create persistent storage directories on the volume
+  mkdir -p "$workspace/.codex-data" "$workspace/.tailscale-state"
+  
+  # Symlink /root/.codex → /workspace/.codex-data
+  if [ -L /root/.codex ]; then
+    # Already a symlink, good
+    log "✓ /root/.codex is already symlinked to persistent storage"
+  elif [ -d /root/.codex ] && [ -z "$(ls -A /root/.codex 2>/dev/null)" ]; then
+    # Directory exists but is empty, safe to replace with symlink
+    rmdir /root/.codex
+    ln -s "$workspace/.codex-data" /root/.codex
+    log "✓ Created symlink: /root/.codex → $workspace/.codex-data"
+  elif [ -d /root/.codex ]; then
+    # Directory exists with content, migrate it
+    log "⚠ Migrating existing /root/.codex to persistent storage..."
+    mv /root/.codex/* "$workspace/.codex-data/" 2>/dev/null || true
+    rmdir /root/.codex
+    ln -s "$workspace/.codex-data" /root/.codex
+    log "✓ Migrated and symlinked: /root/.codex → $workspace/.codex-data"
+  else
+    # Doesn't exist, create symlink directly
+    ln -s "$workspace/.codex-data" /root/.codex
+    log "✓ Created symlink: /root/.codex → $workspace/.codex-data"
+  fi
+  
+  # Symlink /var/lib/tailscale → /workspace/.tailscale-state
+  if [ -L /var/lib/tailscale ]; then
+    # Already a symlink, good
+    log "✓ /var/lib/tailscale is already symlinked to persistent storage"
+  elif [ -d /var/lib/tailscale ] && [ -z "$(ls -A /var/lib/tailscale 2>/dev/null)" ]; then
+    # Directory exists but is empty, safe to replace with symlink
+    rmdir /var/lib/tailscale
+    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
+    log "✓ Created symlink: /var/lib/tailscale → $workspace/.tailscale-state"
+  elif [ -d /var/lib/tailscale ]; then
+    # Directory exists with content, migrate it
+    log "⚠ Migrating existing /var/lib/tailscale to persistent storage..."
+    mv /var/lib/tailscale/* "$workspace/.tailscale-state/" 2>/dev/null || true
+    rmdir /var/lib/tailscale
+    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
+    log "✓ Migrated and symlinked: /var/lib/tailscale → $workspace/.tailscale-state"
+  else
+    # Doesn't exist, create symlink directly
+    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
+    log "✓ Created symlink: /var/lib/tailscale → $workspace/.tailscale-state"
+  fi
+}
 
 # --- Tailscale ---------------------------------------------------------------
 AUTHKEY="${TS_AUTHKEY:-${TAILSCALE_AUTHKEY:-}}"
@@ -54,18 +125,18 @@ start_tailscale() {
   # Idempotent join: skip `tailscale up` if the daemon reports "Running".
   if tailscale --socket="$SOCKET" status --json 2>/dev/null \
        | grep -q '"BackendState":[[:space:]]*"Running"'; then
-    log "Already connected to the tailnet — skipping 'tailscale up'."
+    log "✓ Already connected to the tailnet — skipping 'tailscale up'."
     return 0
   fi
 
-  log "Joining tailnet and enabling Tailscale SSH."
+  log "Joining tailnet and enabling Tailscale SSH..."
   # shellcheck disable=SC2086 # TS_EXTRA_ARGS is intentionally word-split.
   if tailscale --socket="$SOCKET" up \
        --ssh \
        --authkey="$AUTHKEY" \
        --hostname="$HOSTNAME_TS" \
        ${TS_EXTRA_ARGS:-}; then
-    log "Tailscale is up (SSH enabled) as '$HOSTNAME_TS'."
+    log "✓ Tailscale is up (SSH enabled) as '$HOSTNAME_TS'."
   else
     log "WARNING: 'tailscale up' failed — continuing without Tailscale."
   fi
@@ -101,6 +172,7 @@ if [ -z "${OPENAI_API_KEY:-}" ] && [ ! -f /root/.codex/auth.json ]; then
 fi
 
 # --- Main --------------------------------------------------------------------
+setup_persistent_dirs
 start_tailscale
 
 PORT="${PORT:-8080}"
@@ -126,3 +198,4 @@ exec codex app-server \
   --listen "ws://${LISTEN_HOST}:${PORT}" \
   --ws-auth capability-token \
   --ws-token-sha256 "${TOKEN_SHA256}"
+
