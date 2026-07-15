@@ -1,216 +1,287 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Codex Remote on Railway — container entrypoint (FIXED for single volume)
+# codex-remote-railway — container entrypoint
 # ---------------------------------------------------------------------------
-# This version uses symlinks to make /root/.codex and /var/lib/tailscale
-# persistent across redeploys by storing them on the /workspace volume.
+# TWO START MODES (selected by the START_MODE env var):
 #
-# With a single volume mount at /workspace:
-#   /workspace/.codex-data → symlinked to /root/.codex
-#   /workspace/.tailscale-state → symlinked to /var/lib/tailscale
+#   tailscale-only   (DEFAULT)
+#     Boot only Tailscale, keep the container alive, and do NOT start
+#     `codex app-server`. Intended for standing up a remote environment
+#     you SSH into over the tailnet to set Codex up interactively (or
+#     to iterate on the Codex layer later). Because Tailscale state
+#     lives on the persistent volume, redeploys reuse the same node
+#     identity and do NOT re-`tailscale up` unless the daemon reports
+#     the node is not Running.
 #
-# This ensures:
-#   1. Codex session state (resume, fork, archive) survives redeploys
-#   2. Tailscale node identity persists so you don't rejoin the tailnet
-#   3. All state lives on one persistent volume
+#   codex+tailscale
+#     Boot Tailscale as above, then exec `codex app-server` with
+#     capability-token WebSocket auth. This is the fully-automated
+#     "remote Codex server" mode.
 #
-# 1. Optionally join a Tailscale tailnet (with Tailscale SSH) — only when
-#    TS_AUTHKEY / TAILSCALE_AUTHKEY is set. Idempotent: persisted state on
-#    the volume keeps the node identity across redeploys, so a subsequent
-#    boot skips `tailscale up`. Tailscale failure never blocks app-server.
-# 2. Derive the WebSocket capability-token SHA-256 digest (from the plaintext
-#    CODEX_WS_TOKEN, unless CODEX_WS_TOKEN_SHA256 is provided directly).
-# 3. Exec `codex app-server --listen ws://0.0.0.0:${PORT}` with capability-
-#    token auth. Clients connect with `codex --remote wss://…
-#    --remote-auth-token-env CODEX_WS_TOKEN` (TLS terminated in front of the
-#    container — Railway public domains and Tailscale HTTPS both do this).
+# PERSISTENCE
+#   Railway allows one volume per service, mounted at /workspace here.
+#   setup_persistent_dirs symlinks the two logical dirs the app cares
+#   about into subdirs of /workspace:
+#     /root/.codex        -> /workspace/.codex-data
+#     /var/lib/tailscale  -> /workspace/.tailscale-state
+#   Migration is dotfile-safe and non-destructive: existing files on
+#   the volume are never overwritten (mv -n), the source dir is only
+#   replaced with a symlink if it becomes empty.
+#
+# TAILSCALE IDEMPOTENCY
+#   start_tailscale:
+#     1. Starts tailscaled with state in /var/lib/tailscale (persisted).
+#     2. Waits for the local API socket to come up.
+#     3. Reads BackendState from `tailscale status --json`:
+#         - "Running"                       -> skip `tailscale up` entirely
+#         - "Stopped" / "NoState" / "NeedsLogin" / anything else
+#                                           -> re-run `tailscale up`
+#     4. When re-running `tailscale up`:
+#         - if persisted state has a node key already, no auth key is
+#           required (Tailscale reuses the stored identity)
+#         - if there is no persisted identity, TS_AUTHKEY MUST be set,
+#           or the entrypoint fails fast with a clear error.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
 log() { printf '[entrypoint] %s\n' "$*"; }
 
-# --- Persistent storage via symlinks on /workspace -------------------------
+START_MODE="${START_MODE:-tailscale-only}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
+
+# --- Persistent storage via symlinks on the mounted volume ------------------
 setup_persistent_dirs() {
-  local workspace="${WORKSPACE_DIR:-/workspace}"
-  
-  # Ensure /workspace exists and is writable
+  local workspace="$WORKSPACE_DIR"
+
   if [ ! -d "$workspace" ]; then
-    log "ERROR: $workspace does not exist or is not mounted."
-    log "       Verify the volume is mounted at /workspace."
+    log "ERROR: $workspace does not exist. Is the Railway volume mounted?"
     exit 1
   fi
-  
-  # Create persistent storage directories on the volume
+
   mkdir -p "$workspace/.codex-data" "$workspace/.tailscale-state"
-  
-  # Symlink /root/.codex → /workspace/.codex-data
-  if [ -L /root/.codex ]; then
-    # Already a symlink, good
-    log "✓ /root/.codex is already symlinked to persistent storage"
-  elif [ -d /root/.codex ] && [ -z "$(ls -A /root/.codex 2>/dev/null)" ]; then
-    # Directory exists but is empty, safe to replace with symlink
-    rmdir /root/.codex
-    ln -s "$workspace/.codex-data" /root/.codex
-    log "✓ Created symlink: /root/.codex → $workspace/.codex-data"
-  elif [ -d /root/.codex ]; then
-    # Directory exists with content, migrate it.
-    # Use find(1) not the shell glob — the glob misses dotfiles, which
-    # left the source dir non-empty and made rmdir fail, crash-looping
-    # the container. `mv -n` never overwrites files that already exist
-    # on the volume, so redeploys with pre-existing state are safe.
-    log "⚠ Migrating existing /root/.codex to persistent storage..."
-    find /root/.codex -mindepth 1 -maxdepth 1 -print0 \
-      | xargs -0 -r -I{} mv -n {} "$workspace/.codex-data/" || true
-    if ! rmdir /root/.codex 2>/dev/null; then
-      log "WARNING: /root/.codex not empty after migration; leaving as-is"
-      log "         and skipping symlink. Inspect manually on next boot."
-      return 0
-    fi
-    ln -s "$workspace/.codex-data" /root/.codex
-    log "✓ Migrated and symlinked: /root/.codex → $workspace/.codex-data"
-  else
-    # Doesn't exist, create symlink directly
-    ln -s "$workspace/.codex-data" /root/.codex
-    log "✓ Created symlink: /root/.codex → $workspace/.codex-data"
-  fi
-  
-  # Symlink /var/lib/tailscale → /workspace/.tailscale-state
-  if [ -L /var/lib/tailscale ]; then
-    # Already a symlink, good
-    log "✓ /var/lib/tailscale is already symlinked to persistent storage"
-  elif [ -d /var/lib/tailscale ] && [ -z "$(ls -A /var/lib/tailscale 2>/dev/null)" ]; then
-    # Directory exists but is empty, safe to replace with symlink
-    rmdir /var/lib/tailscale
-    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
-    log "✓ Created symlink: /var/lib/tailscale → $workspace/.tailscale-state"
-  elif [ -d /var/lib/tailscale ]; then
-    # Directory exists with content, migrate it (dotfile-safe, same as
-    # /root/.codex above).
-    log "⚠ Migrating existing /var/lib/tailscale to persistent storage..."
-    find /var/lib/tailscale -mindepth 1 -maxdepth 1 -print0 \
-      | xargs -0 -r -I{} mv -n {} "$workspace/.tailscale-state/" || true
-    if ! rmdir /var/lib/tailscale 2>/dev/null; then
-      log "WARNING: /var/lib/tailscale not empty after migration; leaving"
-      log "         as-is and skipping symlink. Inspect manually."
-      return 0
-    fi
-    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
-    log "✓ Migrated and symlinked: /var/lib/tailscale → $workspace/.tailscale-state"
-  else
-    # Doesn't exist, create symlink directly
-    ln -s "$workspace/.tailscale-state" /var/lib/tailscale
-    log "✓ Created symlink: /var/lib/tailscale → $workspace/.tailscale-state"
-  fi
+
+  _link_persistent_dir "/root/.codex"       "$workspace/.codex-data"
+  _link_persistent_dir "/var/lib/tailscale" "$workspace/.tailscale-state"
 }
 
-# --- Tailscale ---------------------------------------------------------------
+_link_persistent_dir() {
+  local logical="$1"
+  local persisted="$2"
+
+  if [ -L "$logical" ]; then
+    local current
+    current="$(readlink -f "$logical" 2>/dev/null || true)"
+    if [ "$current" = "$persisted" ]; then
+      log "✓ $logical already symlinked to $persisted"
+      return 0
+    fi
+    log "Retargeting symlink $logical -> $persisted (was: $current)"
+    rm -f "$logical"
+    ln -s "$persisted" "$logical"
+    return 0
+  fi
+
+  if [ -e "$logical" ]; then
+    # Not a symlink but exists -> plain dir. Migrate contents into the
+    # persisted target (dotfile-safe, non-destructive) then symlink.
+    if [ -d "$logical" ] && [ -z "$(ls -A "$logical" 2>/dev/null || true)" ]; then
+      rmdir "$logical"
+    else
+      log "⚠ Migrating existing $logical into $persisted (mv -n, dotfile-safe)"
+      find "$logical" -mindepth 1 -maxdepth 1 -print0 \
+        | xargs -0 -r -I{} mv -n {} "$persisted/" || true
+      if ! rmdir "$logical" 2>/dev/null; then
+        log "WARNING: $logical still not empty after migration; leaving as-is"
+        return 0
+      fi
+    fi
+  fi
+
+  mkdir -p "$(dirname "$logical")"
+  ln -s "$persisted" "$logical"
+  log "✓ Linked $logical -> $persisted"
+}
+
+# --- Tailscale --------------------------------------------------------------
 AUTHKEY="${TS_AUTHKEY:-${TAILSCALE_AUTHKEY:-}}"
 TS_STATE_DIR_DEFAULT="/var/lib/tailscale"
 STATE_DIR="${TS_STATE_DIR:-$TS_STATE_DIR_DEFAULT}"
 SOCKET="${TS_SOCKET:-/tmp/tailscaled.sock}"
 HOSTNAME_TS="${TS_HOSTNAME:-codex-remote-railway}"
+TAILSCALED_PID=""
+
+# Return the Tailscale BackendState string, or "NoDaemon" if the API socket
+# is not responding. Used to decide whether to skip `tailscale up`.
+_ts_backend_state() {
+  tailscale --socket="$SOCKET" status --json 2>/dev/null \
+    | grep -o '"BackendState":[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed -E 's/.*"BackendState":[[:space:]]*"([^"]*)".*/\1/' \
+    || printf 'NoDaemon'
+}
+
+# True if the persisted Tailscale state directory contains a node key. In
+# that case `tailscale up` can re-use the existing identity without needing
+# TS_AUTHKEY. If the state is empty (first boot on a fresh volume), an
+# auth key is required.
+_ts_has_persisted_identity() {
+  [ -s "$STATE_DIR/tailscaled.state" ]
+}
 
 start_tailscale() {
-  if [ -z "$AUTHKEY" ]; then
-    log "No TS_AUTHKEY / TAILSCALE_AUTHKEY set — skipping Tailscale."
-    return 0
-  fi
-
-  log "Tailscale auth key detected — starting tailscaled (userspace networking)."
   mkdir -p "$STATE_DIR" 2>/dev/null || {
-    log "WARNING: could not create $STATE_DIR — falling back to /tmp/tailscale."
+    log "WARNING: could not create $STATE_DIR — falling back to /tmp/tailscale"
     STATE_DIR="/tmp/tailscale"
     mkdir -p "$STATE_DIR"
   }
 
+  log "Starting tailscaled (userspace networking, state=$STATE_DIR)"
   tailscaled \
     --state="$STATE_DIR/tailscaled.state" \
     --socket="$SOCKET" \
     --tun=userspace-networking &
+  TAILSCALED_PID=$!
 
   # Wait for the local API to come up.
-  n=0
-  until tailscale --socket="$SOCKET" status --json 2>/dev/null | grep -q '"BackendState"' \
-        || [ "$n" -ge 30 ]; do
+  local n=0 backend=""
+  while [ "$n" -lt 30 ]; do
+    backend="$(_ts_backend_state)"
+    case "$backend" in
+      Running|Stopped|Starting|NeedsLogin|NoState) break ;;
+    esac
     n=$((n + 1))
     sleep 1
   done
 
-  # Idempotent join: skip `tailscale up` if the daemon reports "Running".
-  if tailscale --socket="$SOCKET" status --json 2>/dev/null \
-       | grep -q '"BackendState":[[:space:]]*"Running"'; then
-    log "✓ Already connected to the tailnet — skipping 'tailscale up'."
+  backend="$(_ts_backend_state)"
+  log "tailscaled reports BackendState=$backend"
+
+  if [ "$backend" = "Running" ]; then
+    log "✓ Tailscale already Running (persisted identity) — skipping 'tailscale up'"
+    _log_ts_identity
     return 0
   fi
 
-  log "Joining tailnet and enabling Tailscale SSH..."
-  # shellcheck disable=SC2086 # TS_EXTRA_ARGS is intentionally word-split.
-  if tailscale --socket="$SOCKET" up \
-       --ssh \
-       --authkey="$AUTHKEY" \
-       --hostname="$HOSTNAME_TS" \
-       ${TS_EXTRA_ARGS:-}; then
-    log "✓ Tailscale is up (SSH enabled) as '$HOSTNAME_TS'."
+  # Any state other than Running -> we need to join (or rejoin).
+  # If we have persisted identity we do NOT need an auth key.
+  local up_args=(--ssh --hostname="$HOSTNAME_TS" --accept-dns=false)
+  if _ts_has_persisted_identity; then
+    log "Persisted Tailscale identity found — re-connecting without auth key"
   else
-    log "WARNING: 'tailscale up' failed — continuing without Tailscale."
+    if [ -z "$AUTHKEY" ]; then
+      log "FATAL: no persisted Tailscale identity and TS_AUTHKEY is not set."
+      log "       Set TS_AUTHKEY on this service to allow the FIRST tailnet"
+      log "       join. Subsequent redeploys will reuse the persisted node"
+      log "       identity and TS_AUTHKEY can be revoked afterwards."
+      exit 1
+    fi
+    log "No persisted identity — joining tailnet with TS_AUTHKEY"
+    up_args+=(--authkey="$AUTHKEY")
+  fi
+
+  # shellcheck disable=SC2086 # TS_EXTRA_ARGS is intentionally word-split.
+  if tailscale --socket="$SOCKET" up "${up_args[@]}" ${TS_EXTRA_ARGS:-}; then
+    log "✓ Tailscale is up (SSH enabled) as '$HOSTNAME_TS'"
+    _log_ts_identity
+  else
+    log "ERROR: 'tailscale up' failed. See tailscaled logs above."
+    exit 1
   fi
 }
 
-# --- Codex app-server auth ---------------------------------------------------
+_log_ts_identity() {
+  local dns ip4
+  dns="$(tailscale --socket="$SOCKET" status --json 2>/dev/null \
+         | grep -o '"DNSName":[[:space:]]*"[^"]*"' | head -1 \
+         | sed -E 's/.*"DNSName":[[:space:]]*"([^"]*)".*/\1/' || true)"
+  ip4="$(tailscale --socket="$SOCKET" ip -4 2>/dev/null | head -1 || true)"
+  [ -n "$dns" ] && log "  tailnet DNS: ${dns%.}"
+  [ -n "$ip4" ] && log "  tailnet IPv4: $ip4"
+}
+
+# --- Codex app-server (only in codex+tailscale mode) ------------------------
 resolve_token_sha256() {
-  # Precedence: explicit digest > derive from plaintext token > error.
   if [ -n "${CODEX_WS_TOKEN_SHA256:-}" ]; then
     printf '%s' "$CODEX_WS_TOKEN_SHA256" | tr -d '[:space:]'
     return 0
   fi
   if [ -n "${CODEX_WS_TOKEN:-}" ]; then
-    printf '%s' "$CODEX_WS_TOKEN" \
-      | sha256sum \
-      | awk '{print $1}'
+    printf '%s' "$CODEX_WS_TOKEN" | sha256sum | awk '{print $1}'
     return 0
   fi
   return 1
 }
 
-# --- Codex config / OpenAI auth ---------------------------------------------
-# Make sure the persisted Codex config dir exists and warn early if there's no
-# way for the model calls to authenticate. The user can either:
-#   * set OPENAI_API_KEY as a Railway variable, OR
-#   * bake a pre-authenticated auth.json into /root/.codex on the volume
-#     (produced by `codex login` on any machine, then copied in).
-mkdir -p /root/.codex
-if [ -z "${OPENAI_API_KEY:-}" ] && [ ! -f /root/.codex/auth.json ]; then
-  log "WARNING: neither OPENAI_API_KEY nor /root/.codex/auth.json is present."
-  log "         The app-server will start but model calls will fail until one"
-  log "         of them is provided. See README → 'Model auth on the server'."
-fi
+start_codex_app_server() {
+  local port="${PORT:-8080}"
+  local listen_host="${CODEX_LISTEN_HOST:-0.0.0.0}"
 
-# --- Main --------------------------------------------------------------------
+  local token_sha256
+  token_sha256="$(resolve_token_sha256 || true)"
+  if [ -z "$token_sha256" ]; then
+    log "FATAL: START_MODE=codex+tailscale but no CODEX_WS_TOKEN or"
+    log "       CODEX_WS_TOKEN_SHA256 is set. Refusing to start an"
+    log "       unauthenticated app-server on a public listener."
+    exit 1
+  fi
+
+  if [ -z "${OPENAI_API_KEY:-}" ] && [ ! -f /root/.codex/auth.json ]; then
+    log "WARNING: neither OPENAI_API_KEY nor /root/.codex/auth.json is present."
+    log "         Model calls will fail until one is provided."
+  fi
+
+  log "Starting codex app-server on ${listen_host}:${port} (capability-token auth)"
+  log "Codex version: $(codex --version 2>/dev/null || echo unknown)"
+
+  # Drop plaintext token from env before exec so it does not leak into
+  # subprocess env dumps or crash logs.
+  unset CODEX_WS_TOKEN
+
+  exec codex app-server \
+    --listen "ws://${listen_host}:${port}" \
+    --ws-auth capability-token \
+    --ws-token-sha256 "$token_sha256"
+}
+
+# --- Signal handling --------------------------------------------------------
+# When Railway sends SIGTERM we want to cleanly stop tailscaled so the
+# persisted state file is flushed to disk before the volume unmounts.
+_shutdown() {
+  log "Received signal — shutting down cleanly"
+  if [ -n "$TAILSCALED_PID" ] && kill -0 "$TAILSCALED_PID" 2>/dev/null; then
+    tailscale --socket="$SOCKET" down 2>/dev/null || true
+    kill -TERM "$TAILSCALED_PID" 2>/dev/null || true
+    wait "$TAILSCALED_PID" 2>/dev/null || true
+  fi
+  exit 0
+}
+trap _shutdown SIGTERM SIGINT
+
+# --- Main -------------------------------------------------------------------
+log "START_MODE=$START_MODE"
 setup_persistent_dirs
 start_tailscale
 
-PORT="${PORT:-8080}"
-LISTEN_HOST="${CODEX_LISTEN_HOST:-0.0.0.0}"
-
-TOKEN_SHA256="$(resolve_token_sha256 || true)"
-if [ -z "$TOKEN_SHA256" ]; then
-  log "FATAL: no CODEX_WS_TOKEN or CODEX_WS_TOKEN_SHA256 set — refusing to"
-  log "       start an unauthenticated app-server on a public listener."
-  log "       Set CODEX_WS_TOKEN (recommended) as a Railway variable."
-  exit 1
-fi
-
-log "Starting codex app-server on ${LISTEN_HOST}:${PORT} (capability-token auth)."
-log "Codex version: $(codex --version 2>/dev/null || echo unknown)"
-
-# Drop the plaintext token from the process env before exec so it does not
-# show up in `codex` subprocess env dumps or crash logs. The digest is all
-# `codex app-server` needs.
-unset CODEX_WS_TOKEN
-
-exec codex app-server \
-  --listen "ws://${LISTEN_HOST}:${PORT}" \
-  --ws-auth capability-token \
-  --ws-token-sha256 "${TOKEN_SHA256}"
-
+case "$START_MODE" in
+  tailscale-only)
+    log "✓ Tailscale-only mode: container will stay alive with tailscaled"
+    log "  running. SSH in over the tailnet to set up Codex:"
+    log "    ssh root@${HOSTNAME_TS}   # (or the tailnet DNS name above)"
+    # Block forever, but keep responding to signals so SIGTERM is handled.
+    # `wait` on a background sleep is the standard trick for a signal-
+    # responsive idle loop under bash.
+    while true; do
+      sleep 3600 &
+      wait $! || true
+    done
+    ;;
+  codex+tailscale)
+    start_codex_app_server
+    ;;
+  *)
+    log "FATAL: unknown START_MODE='$START_MODE'. Expected one of:"
+    log "       tailscale-only | codex+tailscale"
+    exit 1
+    ;;
+esac
