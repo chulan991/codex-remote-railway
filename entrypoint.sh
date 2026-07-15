@@ -54,10 +54,19 @@ setup_persistent_dirs() {
     ln -s "$workspace/.codex-data" /root/.codex
     log "✓ Created symlink: /root/.codex → $workspace/.codex-data"
   elif [ -d /root/.codex ]; then
-    # Directory exists with content, migrate it
+    # Directory exists with content, migrate it.
+    # Use find(1) not the shell glob — the glob misses dotfiles, which
+    # left the source dir non-empty and made rmdir fail, crash-looping
+    # the container. `mv -n` never overwrites files that already exist
+    # on the volume, so redeploys with pre-existing state are safe.
     log "⚠ Migrating existing /root/.codex to persistent storage..."
-    mv /root/.codex/* "$workspace/.codex-data/" 2>/dev/null || true
-    rmdir /root/.codex
+    find /root/.codex -mindepth 1 -maxdepth 1 -print0 \
+      | xargs -0 -r -I{} mv -n {} "$workspace/.codex-data/" || true
+    if ! rmdir /root/.codex 2>/dev/null; then
+      log "WARNING: /root/.codex not empty after migration; leaving as-is"
+      log "         and skipping symlink. Inspect manually on next boot."
+      return 0
+    fi
     ln -s "$workspace/.codex-data" /root/.codex
     log "✓ Migrated and symlinked: /root/.codex → $workspace/.codex-data"
   else
@@ -76,10 +85,16 @@ setup_persistent_dirs() {
     ln -s "$workspace/.tailscale-state" /var/lib/tailscale
     log "✓ Created symlink: /var/lib/tailscale → $workspace/.tailscale-state"
   elif [ -d /var/lib/tailscale ]; then
-    # Directory exists with content, migrate it
+    # Directory exists with content, migrate it (dotfile-safe, same as
+    # /root/.codex above).
     log "⚠ Migrating existing /var/lib/tailscale to persistent storage..."
-    mv /var/lib/tailscale/* "$workspace/.tailscale-state/" 2>/dev/null || true
-    rmdir /var/lib/tailscale
+    find /var/lib/tailscale -mindepth 1 -maxdepth 1 -print0 \
+      | xargs -0 -r -I{} mv -n {} "$workspace/.tailscale-state/" || true
+    if ! rmdir /var/lib/tailscale 2>/dev/null; then
+      log "WARNING: /var/lib/tailscale not empty after migration; leaving"
+      log "         as-is and skipping symlink. Inspect manually."
+      return 0
+    fi
     ln -s "$workspace/.tailscale-state" /var/lib/tailscale
     log "✓ Migrated and symlinked: /var/lib/tailscale → $workspace/.tailscale-state"
   else
