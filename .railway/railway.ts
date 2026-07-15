@@ -4,10 +4,14 @@
 // Provisions the "Codex app-server on Railway" stack:
 //
 //   - app         : the codex app-server (built from this repo's Dockerfile)
-//   - codex-data  : a persistent volume mounted at /workspace and used for
-//                   Codex config/session state (/root/.codex) + Tailscale
-//                   state (/var/lib/tailscale). ONE volume, three bind
-//                   locations — see the volumeMounts block below.
+//   - codex-data  : a SINGLE persistent volume mounted at /workspace.
+//                   Railway allows one volume per service, mounted at one
+//                   path. The entrypoint symlinks the other two dirs that
+//                   need to survive redeploys INTO subdirs of /workspace:
+//                     /root/.codex        -> /workspace/.codex-data
+//                     /var/lib/tailscale  -> /workspace/.tailscale-state
+//                   This gives three logical persistence locations backed
+//                   by one disk. All three survive redeploys.
 //
 // Secrets (CODEX_WS_TOKEN, OPENAI_API_KEY, TS_AUTHKEY) are NOT declared here.
 // They are set manually on the app service in the Railway dashboard so an
@@ -43,13 +47,17 @@ const REGION = "us-west2";
 
 export default defineRailway((_ctx) => {
   // --- Persistent volume --------------------------------------------------
-  // One volume, three mount points:
-  //   /workspace        — repos, scratch dirs, anything Codex checks out
-  //   /root/.codex      — Codex config, auth, session/resume state
-  //   /var/lib/tailscale — Tailscale state (only used when TS_AUTHKEY is set)
+  // ONE volume, ONE mount point at /workspace. Railway's contract is one
+  // volume per service. The entrypoint symlinks /root/.codex and
+  // /var/lib/tailscale into subdirs of /workspace on boot (idempotent,
+  // non-destructive — migrates existing dir contents into the volume the
+  // first time it runs, then only relinks on subsequent boots).
   //
-  // Persisting /root/.codex is what lets `codex resume`, `codex fork`,
-  // `codex archive`, and Tailscale idempotency survive redeploys.
+  // Detaching a mounted volume or changing placement is treated as
+  // destructive by `railway config apply`, so as long as this mount stays
+  // declared the volume is preserved across redeploys and re-applies. This
+  // is what lets `codex resume`, `codex fork`, `codex archive`, and the
+  // Tailscale node identity survive a redeploy.
   const codexData = volume("codex-data", { region: REGION, sizeMB: 5120 });
 
   // --- codex app-server ---------------------------------------------------
@@ -58,8 +66,6 @@ export default defineRailway((_ctx) => {
     replicas: 1,
     volumeMounts: {
       "/workspace": codexData,
-      "/root/.codex": codexData,
-      "/var/lib/tailscale": codexData,
     },
     env: {
       // The entrypoint binds `codex app-server` to ws://0.0.0.0:${PORT}.
@@ -71,6 +77,11 @@ export default defineRailway((_ctx) => {
       // "Remaining manual steps" section of .railway/README.md.
       CODEX_HOME: "/root/.codex",
       CODEX_LOG_LEVEL: "info",
+
+      // Where the entrypoint expects the volume to be mounted. Overridable
+      // for advanced setups, but the default is what the shipped
+      // entrypoint symlinks into.
+      WORKSPACE_DIR: "/workspace",
 
       // --- SECRETS: set manually on the app service (NOT declared here) ---
       // CODEX_WS_TOKEN      = strong random token (paired with the client's
