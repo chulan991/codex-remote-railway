@@ -1,0 +1,21 @@
+# Node / Railway SDK
+node_modules/
+npm-debug.log*
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Personal per-developer overrides (AGENTS.md standard)
+AGENTS.local.md
+CLAUDE.md
+
+# Local Codex state (never commit)
+.codex/
+auth.json

@@ -1,0 +1,13 @@
+{
+  "name": "codex-remote-railway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deploy `codex app-server` on Railway with optional Tailscale, so `codex --remote` on your local machine offloads all execution to the server.",
+  "scripts": {
+    "railway:plan": "railway config plan",
+    "railway:apply": "railway config apply"
+  },
+  "devDependencies": {
+    "railway": "^3.5.2"
+  }
+}
