@@ -1,12 +1,24 @@
-# Codex Remote on Railway
+# codex-remote-railway
 
-Deploy [`codex app-server`](https://developers.openai.com/codex/cli/reference)
-as a long-lived service on [Railway](https://railway.com), with **optional**
-[Tailscale](https://tailscale.com) so you can reach it privately over your
-tailnet.
+A long-lived remote development container on [Railway](https://railway.com),
+accessed privately over [Tailscale](https://tailscale.com). Ships in two
+modes selected by the `START_MODE` env var:
 
-The TUI runs on your laptop; **all execution — model calls, sandboxing, git
-work, package installs, disk I/O — runs on the Railway container**:
+- **`tailscale-only`** (default) — boot just Tailscale + Tailscale SSH.
+  You SSH in over the tailnet to work interactively (or set Codex up by
+  hand). Nothing else is started, so the container stays quiet and cheap.
+- **`codex+tailscale`** — boot Tailscale, then run
+  [`codex app-server`](https://developers.openai.com/codex/cli/reference)
+  with capability-token WebSocket auth so a local `codex --remote wss://…`
+  client attaches to it.
+
+Either way, the Tailscale node identity lives on the persistent volume, so
+redeploys reuse the same tailnet DNS name and IP — no re-join, no new
+machine registration.
+
+When the Codex mode is enabled, the TUI runs on your laptop and **all
+execution — model calls, sandboxing, git work, package installs, disk I/O
+— runs on the Railway container**:
 
 ```
    your laptop                             Railway service
@@ -79,13 +91,14 @@ Railway scans `.env.example` in the repo root and offers these keys when you
 create the service. See [`.env.example`](./.env.example) for the fully
 annotated list. The minimum is:
 
-| Variable          | Required?                                        | What it does                                                                                     |
-|-------------------|--------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| `CODEX_WS_TOKEN`  | **Yes**, unless you set `CODEX_WS_TOKEN_SHA256`  | Plaintext capability token. The entrypoint derives the SHA-256 digest at boot and drops the plaintext from the process env before `exec`. |
-| `CODEX_WS_TOKEN_SHA256` | Alternative to the above                    | Pre-computed SHA-256 hex digest. Prefer this if you don't want the plaintext token on the server. |
-| `OPENAI_API_KEY`  | **Yes**, unless you place an `auth.json` on the volume | Auth for the model API calls made by the app-server.                                       |
-| `TS_AUTHKEY`      | Optional                                         | Reusable Tailscale auth key. Presence gates the whole tailnet feature.                          |
-| `TS_HOSTNAME`     | Optional                                         | Tailnet node name (default `codex-remote-railway`).                                              |
+| Variable                | Required?                                                             | What it does                                                                                     |
+|-------------------------|-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| `START_MODE`            | Defaults to `tailscale-only`                                          | Selects the container mode. Set to `codex+tailscale` to run `codex app-server`.                  |
+| `TS_AUTHKEY`            | **Yes**, on FIRST boot only                                           | Reusable Tailscale auth key. Persisted node identity means later redeploys don't need it.        |
+| `TS_HOSTNAME`           | Optional                                                              | Tailnet node name (default `codex-remote-railway`).                                              |
+| `CODEX_WS_TOKEN`        | Required only when `START_MODE=codex+tailscale` (or use the SHA256)   | Plaintext capability token. The entrypoint derives the SHA-256 digest at boot and drops the plaintext from the process env before `exec`. |
+| `CODEX_WS_TOKEN_SHA256` | Alternative to `CODEX_WS_TOKEN`                                       | Pre-computed SHA-256 hex digest. Prefer this if you don't want the plaintext token on the server. |
+| `OPENAI_API_KEY`        | Required for model calls in `codex+tailscale` mode (or use `auth.json` on the volume) | Auth for the model API calls made by the app-server.                                             |
 
 Generate a token pair with the helper:
 
@@ -124,23 +137,41 @@ export CODEX_WS_TOKEN='the-plaintext-token'
 > same version on your laptop (`npm i -g @openai/codex@<version>`). Bump
 > both sides together.
 
-## Persistent storage caveat (important)
+## Persistent storage (important)
 
-Railway container filesystems are **ephemeral** — anything written to disk is
-lost on redeploy/restart unless a **Volume** is attached. The IaC in
-`.railway/railway.ts` handles this by mounting the `codex-data` volume at
-three paths:
+Railway container filesystems are **ephemeral** — anything written to disk
+is lost on redeploy/restart unless a **Volume** is attached. Railway also
+allows exactly **one volume per service, mounted at exactly one path**, so
+this repo uses a single `codex-data` volume mounted at `/workspace` and the
+entrypoint symlinks the other two directories that need to survive:
 
-- `/workspace` — repos, scratch dirs, whatever Codex checks out.
-- `/root/.codex` — Codex config + auth (`auth.json`) + session state, so
-  `codex resume`, `codex fork`, `codex archive`, and `codex unarchive`
-  survive redeploys.
-- `/var/lib/tailscale` — Tailscale state, so the node keeps its identity
-  across redeploys (which is what makes the entrypoint's "skip if already
-  connected" check idempotent).
+- `/workspace` — repos, scratch dirs, whatever you check out.
+- `/root/.codex` → `/workspace/.codex-data` — Codex config + auth
+  (`auth.json`) + session state, so `codex resume`, `codex fork`,
+  `codex archive`, and `codex unarchive` survive redeploys.
+- `/var/lib/tailscale` → `/workspace/.tailscale-state` — Tailscale state,
+  so the node keeps its identity across redeploys and the entrypoint's
+  "skip `tailscale up` if BackendState is already Running" check works.
 
-If you follow the manual path (path B) you must create the volume yourself
-and add all three mount points.
+Migration is dotfile-safe and non-destructive: on first boot the entrypoint
+moves any existing dir contents onto the volume with `mv -n` (never
+overwrites) and only replaces the source dir with a symlink if it becomes
+empty afterwards.
+
+## Tailscale-only mode — SSH into the box
+
+Once the service is deployed with `START_MODE=tailscale-only` (the default):
+
+```sh
+# From any machine on your tailnet:
+ssh root@codex-remote-railway   # or the exact tailnet DNS name printed at boot
+```
+
+Tailscale SSH is enabled via `tailscale up --ssh`, so authentication is
+handled by the tailnet, not by a password or SSH key on the container. From
+that shell you can `codex login`, clone repos into `/workspace`, and
+generally set things up before flipping the container to `codex+tailscale`
+mode.
 
 ## Security
 
