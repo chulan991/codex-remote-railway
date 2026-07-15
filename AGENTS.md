@@ -12,10 +12,23 @@
 
 ## Project
 
-**codex-remote-railway** deploys [`codex app-server`](https://developers.openai.com/codex/cli/reference)
-on [Railway](https://railway.com) so a local `codex --remote wss://…` client
-can offload all execution to the remote container. Optional Tailscale
-integration lets you reach the app-server privately over a tailnet.
+**codex-remote-railway** is a long-lived remote development container on
+[Railway](https://railway.com), accessed privately over
+[Tailscale](https://tailscale.com). Two start modes selected by the
+`START_MODE` env var:
+
+- **`tailscale-only`** (default) — boot just tailscaled + Tailscale SSH.
+  Container stays alive as an idle tailnet node so an operator can SSH in
+  and work interactively. Codex is not started.
+- **`codex+tailscale`** — boot Tailscale, then run
+  [`codex app-server`](https://developers.openai.com/codex/cli/reference)
+  with capability-token WebSocket auth so a local `codex --remote wss://…`
+  client attaches to the container.
+
+Tailscale state (and therefore the tailnet node identity) persists on the
+/workspace volume so redeploys never cause a re-join. The entrypoint only
+invokes `tailscale up` when BackendState is not `Running`, and only requires
+`TS_AUTHKEY` on the very first boot (when no persisted identity exists).
 
 Read next:
 - [`README.md`](./README.md) — human-facing overview and quick start
@@ -120,6 +133,13 @@ Examples: `cm/feature/ws-signed-bearer-token`, `cm/chore/bump-codex-0.42`,
 
 - **Do not** commit real tokens, `OPENAI_API_KEY`, `TS_AUTHKEY`, or any
   `auth.json`. `.env` is gitignored — keep it that way.
+- **Do not** unconditionally call `tailscale up` in the entrypoint. Always
+  check `BackendState` first and skip when it is `Running`. Rejoining a
+  healthy node needlessly rotates keys and pollutes the Tailscale admin
+  console with duplicate machines.
+- **Do not** require `TS_AUTHKEY` when a persisted node identity is
+  already present at `/var/lib/tailscale/tailscaled.state`. The auth key
+  is only needed on the FIRST boot with an empty volume.
 - **Do not** bind `codex app-server` to a public listener without capability
   token or signed bearer token auth. The entrypoint refuses to start without
   `CODEX_WS_TOKEN` (or `CODEX_WS_TOKEN_SHA256`) for exactly this reason.
