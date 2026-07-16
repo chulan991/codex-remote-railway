@@ -44,6 +44,30 @@ Unset `TS_AUTHKEY` on the app service and redeploy. The entrypoint logs
 "skipping Tailscale" and the app-server keeps running; the tailnet node
 disappears until you re-set the key.
 
+## Recover from a de-authorized tailnet node
+
+Symptoms: entrypoint logs `Persisted Tailscale identity found` followed by
+`Switching ipn state NoState -> NeedsLogin` and an interactive
+`login.tailscale.com/a/...` URL. This happens when the node was removed or
+de-authorized in the Tailscale admin console but the persisted identity is
+still on the `/workspace` volume, so the daemon keeps replaying the
+rejected credentials.
+
+Two levers, pick one:
+
+1. **Re-attach the existing identity (preferred).** Rotate `TS_AUTHKEY` in
+   the Tailscale admin and set the new value on the Railway service. On
+   next boot the entrypoint sees `BackendState=NeedsLogin` and re-attaches
+   with `--authkey ... --force-reauth` automatically. No local state
+   change, no new node in the admin console.
+2. **Wipe local state and register a fresh node.** Set `TS_WIPE_STATE=1`
+   on the service (together with a valid `TS_AUTHKEY`) and redeploy. The
+   entrypoint deletes `/var/lib/tailscale/*` before starting tailscaled,
+   so the daemon registers a new node under the same `TS_HOSTNAME`.
+   **Unset `TS_WIPE_STATE` immediately after the successful boot** —
+   leaving it on rotates the identity on every redeploy and pollutes the
+   admin console with duplicate machines.
+
 ## Reach the container's shell
 
 - **Tailscale enabled:** `ssh root@codex-remote-railway.<tailnet>.ts.net`
@@ -59,4 +83,5 @@ disappears until you re-set the key.
 | Client connects, then immediately disconnects with a protocol error.       | Client and server on different `codex` versions.                                                             | Pin `CODEX_VERSION` on both sides.                                                       |
 | Model calls fail with 401/403 after attaching.                             | No `OPENAI_API_KEY` on the app service and no `auth.json` on the volume.                                     | Set one of them.                                                                         |
 | Tailscale never comes up.                                                  | `TS_AUTHKEY` is single-use and was already consumed on a previous boot.                                       | Generate a **reusable** auth key and update `TS_AUTHKEY`.                                |
+| Boot logs show `BackendState=NeedsLogin` and an interactive auth URL.       | Persisted node identity was de-authorized upstream; daemon keeps replaying rejected creds.                     | See [Recover from a de-authorized tailnet node](#recover-from-a-de-authorized-tailnet-node). |
 | Sessions vanish after redeploy.                                            | `/root/.codex` is not on the persistent volume.                                                              | Confirm the `codex-data` volume is mounted at `/root/.codex` in the service settings.    |
