@@ -129,12 +129,35 @@ _ts_has_persisted_identity() {
   [ -s "$STATE_DIR/tailscaled.state" ]
 }
 
+# Recovery lever: when TS_WIPE_STATE=1, delete persisted Tailscale state
+# before starting tailscaled. Used when the node has been de-authorized
+# upstream (identity file is still present locally, so the daemon reuses
+# it, but the coordination server rejects it and forces NeedsLogin). After
+# a successful re-join the operator MUST unset TS_WIPE_STATE — otherwise
+# every redeploy will rotate the node identity and pollute the admin
+# console with duplicate machines.
+_wipe_ts_state_if_requested() {
+  case "${TS_WIPE_STATE:-}" in
+    1|true|TRUE|yes|YES)
+      if [ -d "$STATE_DIR" ]; then
+        log "⚠ TS_WIPE_STATE=1 — deleting persisted tailnet identity in $STATE_DIR"
+        # Best-effort — the directory may be a symlink onto the volume.
+        # We intentionally wipe contents, not the directory itself, so the
+        # link target keeps its permissions.
+        find "$STATE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
 start_tailscale() {
   mkdir -p "$STATE_DIR" 2>/dev/null || {
     log "WARNING: could not create $STATE_DIR — falling back to /tmp/tailscale"
     STATE_DIR="/tmp/tailscale"
     mkdir -p "$STATE_DIR"
   }
+
+  _wipe_ts_state_if_requested
 
   log "Starting tailscaled (userspace networking, state=$STATE_DIR)"
   tailscaled \
@@ -164,9 +187,28 @@ start_tailscale() {
   fi
 
   # Any state other than Running -> we need to join (or rejoin).
-  # If we have persisted identity we do NOT need an auth key.
+  # Three cases:
+  #   1. NeedsLogin — persisted identity is present but the coordination
+  #      server rejected it (node de-authorized, key expired, tailnet
+  #      moved). We MUST re-attach with TS_AUTHKEY; retrying without one
+  #      just loops on the same interactive-auth URL.
+  #   2. Persisted identity + not NeedsLogin — happy re-join, no key
+  #      required.
+  #   3. No persisted identity — first boot on a fresh volume, TS_AUTHKEY
+  #      is required.
   local up_args=(--ssh --hostname="$HOSTNAME_TS" --accept-dns=false)
-  if _ts_has_persisted_identity; then
+  if [ "$backend" = "NeedsLogin" ]; then
+    if [ -z "$AUTHKEY" ]; then
+      log "FATAL: tailscaled reports NeedsLogin and TS_AUTHKEY is not set."
+      log "       The persisted node identity has been rejected by the"
+      log "       coordination server (de-authorized, expired, or moved"
+      log "       tailnets). Set TS_AUTHKEY to re-attach, or set"
+      log "       TS_WIPE_STATE=1 to wipe local state and register a new node."
+      exit 1
+    fi
+    log "tailscaled needs re-login — re-attaching with TS_AUTHKEY"
+    up_args+=(--authkey="$AUTHKEY" --force-reauth)
+  elif _ts_has_persisted_identity; then
     log "Persisted Tailscale identity found — re-connecting without auth key"
   else
     if [ -z "$AUTHKEY" ]; then
